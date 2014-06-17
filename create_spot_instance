@@ -1,0 +1,140 @@
+#!/bin/bash
+COUNT=1
+AMI="ami-xxxxxxxx"
+KEY_NAME="xxxxx"
+INSTANCE_TYPE="m1.small"
+PRICE="0.05"
+AZ="ap-northeast-1c"
+SUBNET_ID="subnet-xxxxxxxx"
+USER_DATA_FILE="something.sh"
+SECURITY_GROUP_IDS="sg-xxxxxxxx"
+
+function print_dot() {
+  for i in `seq 1 5`
+  do
+    echo -n ". "
+    sleep 3
+  done
+}
+
+function usage_exit() {
+  local name=`basename $0`
+  cat << EOF
+Usage ${name} [option]...
+
+  --count              (optional) request count. default=1
+  --ami                base AMI files's ID
+  --price              maximum price
+  --type               t1.micro, m1.small, m1.medium...
+  --user_data          (optional) user data file path
+  --az                 availability zone
+  --subnet_id          subnet ID
+  --security_group_ids security_group IDs
+  --key_name           initial user's secret key name
+  --help               see this message
+EOF
+  exit $1
+}
+
+which jq &>/dev/null
+if [ $? -ne 0 ]; then
+  echo "this script needs jq command"
+  exit 1
+fi
+OPT=`getopt -o "" -l ami: -l price: -l type: -l user_data: -l count: -l az: -l subnet_id: -l security_group_ids: -l help -- "$@"`
+[ $? != 0 ] && usage_exit 1
+eval set -- "${OPT}"
+until [ "$1" == "--" ]
+do
+  case $1 in
+    --ami)
+      AMI=$2
+      ;;
+    --price)
+      PRICE=$2
+      ;;
+    --type)
+      INSTANCE_TYPE=$2
+      ;;
+    --user_data)
+      USER_DATA_FILE=$2
+      ;;
+    --count)
+      COUNT=$2
+      ;;
+    --subnet_id)
+      SUBNET_ID=$2
+      ;;
+    --security_group_ids)
+      SECURITY_GROUP_IDS=$2
+      ;;
+    --az)
+      AZ=$2
+      ;;
+    --help)
+      usage_exit 0
+      ;;
+  esac
+  shift
+done
+USER_DATA=`openssl enc -base64 -in ${USER_DATA_FILE} | perl -pe 's/\n/\\\\n/'`
+
+cat << EOF > /tmp/launch_config.json
+{
+  "ImageId": "${AMI}",
+  "KeyName": "${KEY_NAME}",
+  "InstanceType": "${INSTANCE_TYPE}",
+  "Placement": {
+    "AvailabilityZone": "${AZ}"
+  },
+  "Monitoring": {
+    "Enabled": false
+  },
+  "NetworkInterfaces": [
+    {
+      "DeviceIndex": 0,
+      "SubnetId": "${SUBNET_ID}",
+      "AssociatePublicIpAddress": true
+    }
+  ],
+  "UserData": "${USER_DATA}"
+}
+EOF
+
+SIR_IDS=`aws ec2 request-spot-instances --instance-count ${COUNT} --spot-price ${PRICE} --type persistent --launch-specification file:///tmp/launch_config.json | jq -r '.SpotInstanceRequests[] | .SpotInstanceRequestId' | tr '\n' ' '`
+echo "[INFO] SpotInstanceRequestIDs: ${SIR_IDS}"
+echo -n "[INFO] waiting"
+INSTANCE_IDS=""
+while [[ "${INSTANCE_IDS}" == *null* || -z "${INSTANCE_IDS}" ]]
+do
+  INSTANCE_IDS=`aws ec2 describe-spot-instance-requests --spot-instance-request-ids ${SIR_IDS} | jq -r '.SpotInstanceRequests[] | .InstanceId' | tr '\n' ' '`
+  print_dot
+done
+
+echo
+echo "[INFO] INSTANCE_IDS: ${INSTANCE_IDS}"
+
+PRIVATE_IPS=""
+while [[ "${PRIVATE_IPS}" == *null* || -z "${PRIVATE_IPS}" ]]
+do
+  aws ec2 describe-instances --instance-ids ${INSTANCE_IDS} > /tmp/resp.json
+  PRIVATE_IPS=`jq -r '.Reservations[] | .Instances[] | .NetworkInterfaces[] | .PrivateIpAddress' /tmp/resp.json | tr '\n' ' '`
+  print_dot
+done
+INTERFACE_IDS=`jq -r '.Reservations[] | .Instances[] | .NetworkInterfaces[] | .NetworkInterfaceId' /tmp/resp.json | tr '\n' ' '`
+echo
+echo "[INFO] PRIVATE_IPS: ${PRIVATE_IPS}"
+echo "[INFO] INTERFACE_IDS: ${INTERFACE_IDS}"
+
+for INTERFACE_ID in ${INTERFACE_IDS}
+do
+  RETURN=`aws ec2 modify-network-interface-attribute --network-interface-id ${INTERFACE_ID} --groups ${SECURITY_GROUP_IDS} | jq -r .return`
+  if [ "${RETURN}" == "true" ]
+  then
+    echo "[INFO] ${INTERFACE_ID} SecutyRule changed"
+  else
+    echo "[ERR] ${INTERFACE_ID} SecutyRule change fail"
+  fi
+done
+rm -f /tmp/resp.json
+rm -f /tmp/launch_config.json
