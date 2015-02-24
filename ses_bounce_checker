@@ -1,0 +1,25 @@
+#!/bin/bash
+set -e
+
+readonly cmd_aws=/usr/local/bin/aws
+readonly cmd_jq=/usr/bin/jq
+readonly cmd_mysql=/usr/bin/mysql
+readonly queue_url="AMAZON_SQS_QUEUE_URL"
+readonly slack_url="SLACK_WEBHOOK_URL"
+readonly awscli_profile="AWSCLI_PROFILE_NAME"
+
+while :
+do
+  data=$(${cmd_aws} sqs receive-message --queue-url "${queue_url}" --profile ${awscli_profile})
+  if [ "${data}" == "" ]
+  then
+    exit 0
+  fi
+
+  text=$(echo ${data} | ${cmd_jq} -r '.Messages[0].Body' | ${cmd_jq} -r '.Message' | ${cmd_jq} '"type: \(.notificationType)\nsource: \(.mail.source)\ndestination: \(.mail.destination[0])\nmessageId: \(.mail.messageId)\ntimestamp: \(.mail.timestamp)"' | tr -d '"')
+  curl -X POST --data-urlencode "payload={\"text\": \"AWS SES bounce mail alert\n${text}\", \"pretext\": \"<!channel>\", \"color\": \"danger\"}" ${slack_url}
+
+  receipt=$(echo ${data} | ${cmd_jq} -r '.Messages[0].ReceiptHandle')
+  ${cmd_aws} sqs delete-message --queue-url "${queue_url}" --receipt-handle="${receipt}" --profile ${awscli_profile}
+  sleep 1
+done
